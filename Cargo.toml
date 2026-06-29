@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 Timothy Redaelli <timothy.redaelli@gmail.com>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "aesgcm-proxy"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+license = "MIT OR Apache-2.0"
+authors = ["Timothy Redaelli <timothy.redaelli@gmail.com>"]
+
+[features]
+default = ["native-tls"]
+native-tls = ["reqwest/native-tls"]
+rustls = ["reqwest/rustls"]
+
+[dependencies]
+axum = "0.8.8"
+reqwest = { version = "0.13", default-features = false, features = ["stream"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+serde = { version = "1", features = ["derive"] }
+url = "2"
+listenfd = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-journald = "0.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
