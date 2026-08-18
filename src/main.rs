@@ -5,7 +5,7 @@
 use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::header::LOCATION,
+    http::header::{AUTHORIZATION, LOCATION},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{post, put},
@@ -25,6 +25,9 @@ use tokio::time::Instant;
 use tracing::{error, info, warn};
 use url::Url;
 
+mod fcm;
+use fcm::VapidSigner;
+
 /// Shared application state: HTTP client + correlation cache.
 struct AppState {
     client: Client,
@@ -33,6 +36,9 @@ struct AppState {
     /// Used by the PUT handler to suppress duplicate wake-ups when an encrypted
     /// payload already arrived.
     recent_posts: Mutex<HashMap<String, Instant>>,
+    /// VAPID signer for the FCM leg. `None` when VAPID_PRIVATE_KEY is unset,
+    /// which leaves /fcm answering 503 while the rest of the proxy works.
+    vapid: Option<VapidSigner>,
 }
 
 /// Correlation window: PUT handler waits this long for a matching POST /aesgcm.
@@ -43,11 +49,6 @@ const CORRELATION_WINDOW: Duration = Duration::from_millis(200);
 /// PUT /<url> — Simple Push (token_type=4) handler.
 ///
 /// Telegram sends a PUT to this route for every push event when token_type=4 is registered.
-/// For regular messages, a matching POST /aesgcm also arrives within CORRELATION_WINDOW —
-/// in that case the encrypted payload already woke the app, so we suppress the PUT.
-/// For encrypted (secret) chats, only the PUT arrives (no content to encrypt); after
-/// waiting the full window we forward an empty synthetic body to wake the app so it
-/// connects and fetches the pending messages via MTProto.
 async fn put_proxy(
     State(state): State<Arc<AppState>>,
     Path(path): Path<String>,
@@ -58,33 +59,47 @@ async fn put_proxy(
         Err(resp) => return resp,
     };
 
-    let key = endpoint.as_str().to_owned();
+    simple_push(&state, &endpoint, None, body).await
+}
 
+/// Simple Push leg, shared by `put_proxy` and `fcm_put`.
+///
+/// For regular messages, a matching POST also arrives within CORRELATION_WINDOW —
+/// in that case the encrypted payload already woke the app, so we suppress the PUT.
+/// For encrypted (secret) chats, only the PUT arrives (no content to encrypt); after
+/// waiting the full window we forward the original Simple Push body (typically
+/// "version=N") as a wake-up. The app receives it, aesgcm decryption fails on the
+/// non-encrypted payload, and it falls back to the MTProto path to retrieve the
+/// pending messages.
+async fn simple_push(
+    state: &AppState,
+    endpoint: &Url,
+    auth: Option<HeaderValue>,
+    body: Bytes,
+) -> Response {
     // Fast path: check if a POST already arrived before we even started waiting.
-    if recent_post_within_window(&state.recent_posts, &key) {
-        info!("put_proxy correlated (pre-wait) for {}", endpoint);
+    if recent_post_within_window(&state.recent_posts, endpoint.as_str()) {
+        info!("put correlated (pre-wait) for {}", fcm::Redacted(endpoint));
         return StatusCode::OK.into_response();
     }
 
     // Wait for the correlation window, then check again.
     tokio::time::sleep(CORRELATION_WINDOW).await;
 
-    if recent_post_within_window(&state.recent_posts, &key) {
-        info!("put_proxy correlated (post-wait) for {}", endpoint);
+    if recent_post_within_window(&state.recent_posts, endpoint.as_str()) {
+        info!("put correlated (post-wait) for {}", fcm::Redacted(endpoint));
         return StatusCode::OK.into_response();
     }
 
-    // No matching POST arrived — forward the original Simple Push body (typically "version=N")
-    // as a wake-up signal. The app receives it, aesgcm decryption fails on the non-encrypted
-    // payload, and it falls back to the MTProto wake-up path to retrieve pending messages.
-    info!("put_proxy synthetic wake-up for {}", endpoint);
-    match forward(&state.client, &endpoint, body).await {
+    info!("put synthetic wake-up for {}", fcm::Redacted(endpoint));
+    match forward(&state.client, endpoint, body, auth).await {
         Ok(upstream) => {
             let status = upstream.status();
             if !status.is_success() {
                 warn!(
-                    "put_proxy synthetic upstream rejected {}: status={}",
-                    endpoint, status
+                    "put synthetic upstream rejected {}: status={}",
+                    fcm::Redacted(endpoint),
+                    status
                 );
             }
             (status, Body::from_stream(upstream.bytes_stream())).into_response()
@@ -144,60 +159,164 @@ async fn aesgcm(
         Err(resp) => return resp,
     };
 
-    let encryption = headers
-        .get("encryption")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let crypto_key = headers
-        .get("crypto-key")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let (encryption, crypto_key) = aesgcm_headers(&headers);
 
     if encryption.is_empty() || crypto_key.is_empty() {
         warn!(
-            "aesgcm request to {} missing Encryption/Crypto-Key headers — decryption will fail on device",
+            "aesgcm request to {} missing Encryption/Crypto-Key headers, decryption will fail on device",
             endpoint
         );
     }
 
     let new_body = make_aesgcm_body(encryption, crypto_key, &body);
 
-    let upstream = match forward(&state.client, &endpoint, new_body).await {
+    post_and_record(&state, &endpoint, None, new_body).await
+}
+
+/// Forward a folded WebPush POST, then record the endpoint in the correlation
+/// cache so the Simple Push leg knows this event was already delivered encrypted.
+async fn post_and_record(
+    state: &AppState,
+    endpoint: &Url,
+    auth: Option<HeaderValue>,
+    body: impl Into<reqwest::Body>,
+) -> Response {
+    let upstream = match forward(&state.client, endpoint, body, auth).await {
         Ok(r) => r,
         Err(e) => return e,
     };
 
-    let upstream_status = upstream.status();
-    info!(
-        "aesgcm forwarded to {}: status={}",
-        endpoint, upstream_status
-    );
-
-    if upstream_status.is_success() {
-        // Record that an encrypted payload was successfully delivered for this endpoint.
-        // The PUT handler checks this to suppress duplicate Simple Push wake-ups.
-        state
-            .recent_posts
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(endpoint.as_str().to_owned(), Instant::now());
-
-        // Normalize any 2xx to 201 Created per WebPush spec to avoid Telegram backoff.
-        let location_val = upstream
-            .headers()
-            .get(LOCATION)
-            .cloned()
-            .or_else(|| HeaderValue::from_str(endpoint.as_str()).ok())
-            .unwrap_or_else(|| HeaderValue::from_static(""));
-
-        return (StatusCode::CREATED, [(LOCATION, location_val)]).into_response();
+    let status = upstream.status();
+    if !status.is_success() {
+        warn!(
+            "upstream rejected {}: status={}",
+            fcm::Redacted(endpoint),
+            status
+        );
+        return (status, Body::from_stream(upstream.bytes_stream())).into_response();
     }
 
-    warn!(
-        "aesgcm upstream rejected {}: status={}",
-        endpoint, upstream_status
+    info!(
+        "forwarded to {}: status={}",
+        fcm::Redacted(endpoint),
+        status
     );
-    (upstream_status, Body::from_stream(upstream.bytes_stream())).into_response()
+
+    state
+        .recent_posts
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(endpoint.as_str().to_owned(), Instant::now());
+
+    // A 201 must carry a Location (RFC 8030 §5); an empty one risks the very
+    // backoff the normalization below is meant to avoid.
+    let location = upstream
+        .headers()
+        .get(LOCATION)
+        .cloned()
+        .or_else(|| HeaderValue::from_str(endpoint.as_str()).ok())
+        .unwrap_or_else(|| HeaderValue::from_static(""));
+
+    // Normalize any 2xx to 201 Created per WebPush spec to avoid Telegram backoff.
+    (StatusCode::CREATED, [(LOCATION, location)]).into_response()
+}
+
+/// POST /fcm/<token>: WebPush leg for the app-embedded FCM distributor.
+///
+/// Same header folding as [`aesgcm`], but the destination is FCM and the request
+/// is VAPID-signed here, because Telegram does not sign. The app receives the
+/// folded body verbatim as the FCM payload and decrypts it with the same code
+/// path as any other distributor.
+async fn fcm_post(
+    State(state): State<Arc<AppState>>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (endpoint, auth) = match fcm_target(&state, &token) {
+        Ok(target) => target,
+        Err(resp) => return resp,
+    };
+
+    let (encryption, crypto_key) = aesgcm_headers(&headers);
+
+    if encryption.is_empty() || crypto_key.is_empty() {
+        warn!(
+            "fcm request to {} missing Encryption/Crypto-Key headers, decryption will fail on device",
+            fcm::Redacted(&endpoint)
+        );
+    }
+
+    let body = make_aesgcm_body(encryption, crypto_key, &body).into();
+    let body = clamp_fcm_payload(&endpoint, body);
+
+    post_and_record(&state, &endpoint, Some(auth), body).await
+}
+
+/// PUT /fcm/<token>: Simple Push (token_type=4) leg for the same distributor.
+async fn fcm_put(
+    State(state): State<Arc<AppState>>,
+    Path(token): Path<String>,
+    body: Bytes,
+) -> Response {
+    // Refuse before the correlation sleep: an unconfigured proxy or a bogus
+    // token must not hold a task for the full window.
+    let (endpoint, auth) = match fcm_target(&state, &token) {
+        Ok(target) => target,
+        Err(resp) => return resp,
+    };
+
+    let body = clamp_fcm_payload(&endpoint, body);
+
+    simple_push(&state, &endpoint, Some(auth), body).await
+}
+
+/// The two aesgcm parameters Telegram sends as headers, empty when absent.
+fn aesgcm_headers(headers: &HeaderMap) -> (&str, &str) {
+    fn get<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+    }
+    (get(headers, "encryption"), get(headers, "crypto-key"))
+}
+
+/// Preconditions shared by both /fcm legs: the proxy must be configured, and the
+/// token must resolve to a URL still under the FCM send prefix.
+#[allow(clippy::result_large_err)]
+fn fcm_target(state: &AppState, token: &str) -> Result<(Url, HeaderValue), Response> {
+    let Some(vapid) = state.vapid.as_ref() else {
+        warn!("fcm request refused: VAPID_PRIVATE_KEY is not configured");
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    };
+
+    let Some(endpoint) = fcm::send_url(token) else {
+        warn!(
+            "SECURITY reject fcm token: does not resolve under {}",
+            fcm::FCM_SEND_PREFIX
+        );
+        return Err(StatusCode::FORBIDDEN.into_response());
+    };
+
+    Ok((endpoint, vapid.authorization()))
+}
+
+/// FCM hard-rejects a body over 4096 bytes with 400, so a payload that only the
+/// fold pushed over the line would be lost outright. Wake the app with an empty
+/// push instead: it falls back to fetching over MTProto, exactly like the
+/// secret-chat path.
+fn clamp_fcm_payload(endpoint: &Url, body: Bytes) -> Bytes {
+    if body.len() <= fcm::MAX_PAYLOAD {
+        return body;
+    }
+    warn!(
+        "fcm payload for {} is {} bytes (limit {}), sending a bare wake-up instead",
+        fcm::Redacted(endpoint),
+        body.len(),
+        fcm::MAX_PAYLOAD
+    );
+    Bytes::new()
 }
 
 // ── security helpers ──────────────────────────────────────────────────────────
@@ -350,22 +469,23 @@ fn validate_endpoint(endpoint: &str) -> Result<Url, Response> {
     Ok(parsed)
 }
 
-/// Forward `body` via POST to `endpoint` with WebPush headers.
+/// Forward `body` via POST to `endpoint` with WebPush headers, plus `auth` for
+/// the legs that must be signed (FCM).
 /// Returns the raw reqwest response on success, or an error `Response` on network failure.
 async fn forward(
     client: &Client,
     endpoint: &Url,
     body: impl Into<reqwest::Body>,
+    auth: Option<HeaderValue>,
 ) -> Result<reqwest::Response, Response> {
-    client
-        .post(endpoint.clone())
-        .body(body)
-        .send()
-        .await
-        .map_err(|err| {
-            error!("forward error: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })
+    let mut req = client.post(endpoint.clone()).body(body);
+    if let Some(auth) = auth {
+        req = req.header(AUTHORIZATION, auth);
+    }
+    req.send().await.map_err(|err| {
+        error!("forward error: {err}");
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })
 }
 
 /// Periodically evict stale entries from the correlation cache.
@@ -428,6 +548,14 @@ fn init_logging() {
 
 #[tokio::main]
 async fn main() {
+    // One-shot helper so a deployment can mint its keypair without extra tooling.
+    if std::env::args().nth(1).as_deref() == Some("--generate-vapid") {
+        let signer = VapidSigner::generate();
+        println!("VAPID_PRIVATE_KEY={}", signer.private_key_base64());
+        println!("public key (paste into the app): {}", signer.public_key());
+        return;
+    }
+
     init_logging();
 
     let mut default_headers = ReqwestHeaderMap::with_capacity(3);
@@ -453,15 +581,36 @@ async fn main() {
         .build()
         .unwrap();
 
+    // An empty value is how an EnvironmentFile spells "not configured"; treat it
+    // like an unset variable rather than exiting into a Restart=on-failure loop.
+    let vapid = match std::env::var("VAPID_PRIVATE_KEY") {
+        Ok(key) if !key.trim().is_empty() => match VapidSigner::from_base64(&key) {
+            Ok(signer) => {
+                info!("FCM leg enabled, VAPID public key {}", signer.public_key());
+                Some(signer)
+            }
+            Err(e) => {
+                error!("VAPID_PRIVATE_KEY rejected: {e}");
+                std::process::exit(1);
+            }
+        },
+        _ => {
+            info!("VAPID_PRIVATE_KEY unset: /fcm disabled, other routes unaffected");
+            None
+        }
+    };
+
     let state = Arc::new(AppState {
         client,
         recent_posts: Mutex::new(HashMap::new()),
+        vapid,
     });
 
     tokio::spawn(cleanup_recent_posts(Arc::clone(&state)));
 
     let app = Router::new()
         .route("/aesgcm", post(aesgcm))
+        .route("/fcm/{token}", post(fcm_post).put(fcm_put))
         .route("/{*path}", put(put_proxy))
         .layer(DefaultBodyLimit::max(65536))
         .with_state(state);

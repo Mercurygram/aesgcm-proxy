@@ -26,9 +26,34 @@ in the body. This proxy exists solely for the legacy `aesgcm` scheme.)
 |---|---|---|
 | `POST` | `/aesgcm?e=<url>` | WebPush: serializes the `Encryption`/`Crypto-Key` headers into the body (`aesgcm\nEncryption: ...\nCrypto-Key: ...\n<ciphertext>`), forwards to the UnifiedPush endpoint, stamps a correlation-cache entry |
 | `PUT` | `/<url>` | Simple Push (token_type=4): waits 200 ms for a matching POST; suppresses the wake-up if found (already delivered as an encrypted payload), else forwards the body as a synthetic wake-up |
+| `POST` | `/fcm/<token>` | Same folding as `/aesgcm`, but the destination is FCM and the request is VAPID-signed here (see below) |
+| `PUT` | `/fcm/<token>` | Simple Push leg of the FCM route, with the same correlation logic as `PUT /<url>` |
 
 The correlation window (200 ms wait, 2 s cache age) prevents duplicate wake-ups
 for regular messages while still letting secret-chat pushes reach the app.
+
+## FCM leg
+
+Google Play Services hands an app a plain WebPush endpoint without any Google
+library on the client, but FCM only accepts pushes to it that carry a
+[VAPID](https://www.rfc-editor.org/rfc/rfc8292) authorization, which Telegram
+does not send. The `/fcm/<token>` routes sign on Telegram's behalf: the app
+registers `https://<proxy>/fcm/<token>` as its endpoint and passes the proxy's
+VAPID **public** key to Play Services, binding the subscription to this proxy.
+
+Mint a keypair once:
+
+```bash
+aesgcm-proxy --generate-vapid
+```
+
+Put `VAPID_PRIVATE_KEY` in the environment of the service and the printed public
+key in the client. Leaving the variable unset or empty disables `/fcm` (503) and
+leaves every other route working; a malformed value aborts startup.
+
+FCM caps a WebPush body at 4096 bytes. When the folded payload would exceed
+that, the proxy sends an empty push instead, so the app still wakes and fetches
+the message over MTProto rather than losing the notification to a 400.
 
 ## Building
 

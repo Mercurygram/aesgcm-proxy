@@ -9,6 +9,8 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/aesgcm-proxy
+# Carries VAPID_PRIVATE_KEY for the FCM leg. Optional: without it /fcm answers 503.
+EnvironmentFile=-/etc/aesgcm-proxy.env
 Restart=on-failure
 RestartSec=5
 
