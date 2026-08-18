@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: 2026 Timothy Redaelli <timothy.redaelli@gmail.com>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Rootless podman deployment via Quadlet.
+# Install under the p2p user: ~/.config/containers/systemd/aesgcm-proxy.container
+# then: systemctl --user daemon-reload && systemctl --user enable --now aesgcm-proxy
+# Fronted by the host reverse proxy, so the port stays bound to loopback.
+
+[Unit]
+Description=Mercurygram aesgcm-proxy (legacy WebPush to UnifiedPush)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=ghcr.io/mercurygram/aesgcm-proxy:latest
+AutoUpdate=registry
+
+# Loopback only: the host reverse proxy forwards to this.
+# The image binds 0.0.0.0:8001 inside its netns; publishing to 127.0.0.1
+# keeps it off the public interface.
+PublishPort=127.0.0.1:8001:8001
+
+# Pass VAPID_PRIVATE_KEY through from the unit environment below. A bare
+# --env NAME is a no-op when the variable is unset, which keeps the FCM leg
+# optional. Quadlet's own [Container] EnvironmentFile= cannot be used here: it
+# accepts neither the "-" ignore-if-missing prefix nor systemd specifiers, and
+# podman run --env-file aborts on a missing file.
+PodmanArgs=--env=VAPID_PRIVATE_KEY
+
+# Hardening (approximates the native systemd unit's sandbox).
+NoNewPrivileges=true
+DropCapability=ALL
+ReadOnly=true
+
+[Service]
+# Carries VAPID_PRIVATE_KEY for the FCM leg. Optional: without it /fcm answers 503.
+EnvironmentFile=-%h/.config/aesgcm-proxy.env
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
