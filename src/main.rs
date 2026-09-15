@@ -472,6 +472,9 @@ fn validate_endpoint(endpoint: &str) -> Result<Url, Response> {
 /// Forward `body` via POST to `endpoint` with WebPush headers, plus `auth` for
 /// the legs that must be signed (FCM).
 /// Returns the raw reqwest response on success, or an error `Response` on network failure.
+// The error variant is a full axum Response and trips result_large_err, but it is
+// built once per failed request, so boxing it would only move the cost around.
+#[allow(clippy::result_large_err)]
 async fn forward(
     client: &Client,
     endpoint: &Url,
