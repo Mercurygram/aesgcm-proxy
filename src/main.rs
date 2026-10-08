@@ -8,7 +8,7 @@ use axum::{
     http::header::{AUTHORIZATION, LOCATION},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{post, put},
+    routing::{get, post, put},
     Router,
 };
 use listenfd::ListenFd;
@@ -611,12 +611,7 @@ async fn main() {
 
     tokio::spawn(cleanup_recent_posts(Arc::clone(&state)));
 
-    let app = Router::new()
-        .route("/aesgcm", post(aesgcm))
-        .route("/fcm/{token}", post(fcm_post).put(fcm_put))
-        .route("/{*path}", put(put_proxy))
-        .layer(DefaultBodyLimit::max(65536))
-        .with_state(state);
+    let app = app_router(state);
 
     let listener = {
         let mut listenfd = ListenFd::from_env();
@@ -638,4 +633,76 @@ async fn main() {
 
     info!("listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Liveness only: no distributor requests or subscription data.
+async fn healthz() -> impl IntoResponse {
+    ([("cache-control", "no-store")], "ok\n")
+}
+
+fn app_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/aesgcm", post(aesgcm))
+        .route("/fcm/{token}", post(fcm_post).put(fcm_put))
+        .route("/{*path}", put(put_proxy))
+        .layer(DefaultBodyLimit::max(65536))
+        .with_state(state)
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    #[tokio::test]
+    async fn health_and_existing_routes_without_vapid() {
+        let state = Arc::new(AppState {
+            client: Client::new(),
+            recent_posts: Mutex::new(HashMap::new()),
+            vapid: None,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app_router(state)).await.unwrap();
+        });
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let response = client.get(format!("{base}/healthz")).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.text().await.unwrap(), "ok\n");
+        let response = client.head(format!("{base}/healthz")).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.bytes().await.unwrap().is_empty());
+        assert_eq!(
+            client
+                .post(format!("{base}/aesgcm"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            client
+                .put(format!("{base}/not-a-url"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        server.abort();
+    }
 }

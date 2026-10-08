@@ -32,6 +32,27 @@ in the body. This proxy exists solely for the legacy `aesgcm` scheme.)
 The correlation window (200 ms wait, 2 s cache age) prevents duplicate wake-ups
 for regular messages while still letting secret-chat pushes reach the app.
 
+## Health check
+
+`GET /healthz` and `HEAD /healthz` return `200 OK`, `Cache-Control: no-store`,
+and a plain-text `ok` body (GET only). This checks HTTP server liveness;
+it does not verify upstream connectivity or delivery to a device. It needs
+no VAPID key and performs no outbound requests. Use a separate forwarding test.
+
+Docker Compose example for the Alpine image:
+
+```yaml
+healthcheck:
+  test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8001/healthz"]
+  interval: 30s
+  timeout: 5s
+  retries: 3
+  start_period: 10s
+```
+
+Adjust the address when changing `LISTEN_ADDR`. Docker health status alone does
+not restart an unhealthy running container.
+
 ## FCM leg
 
 Google Play Services hands an app a plain WebPush endpoint without any Google
