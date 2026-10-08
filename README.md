@@ -1,5 +1,6 @@
 <!--
 SPDX-FileCopyrightText: 2026 Timothy Redaelli <timothy.redaelli@gmail.com>
+SPDX-FileCopyrightText: 2026 lesecuritae <lesecuritae@tutanota.com>
 
 SPDX-License-Identifier: MIT OR Apache-2.0
 -->
@@ -52,6 +53,51 @@ healthcheck:
 
 Adjust the address when changing `LISTEN_ADDR`. Docker health status alone does
 not restart an unhealthy running container.
+
+For HAProxy, a backend HTTP check can use:
+
+```haproxy
+option httpchk
+http-check send meth GET uri /healthz
+http-check expect status 200
+```
+
+Unlike probing a push route with deliberately invalid parameters, this does not
+exercise push validation or forwarding and gives monitoring a dedicated status.
+
+## Forwarding metrics (optional)
+
+Set `ENABLE_METRICS=1` to enable `GET /metrics` (and HEAD) in Prometheus text
+format on the existing listener. It is disabled by default (`GET /metrics`
+returns `404`). The endpoint has no built-in authentication: keep it private using reverse-proxy access controls or
+a private listener/network. For a public gateway, do not publish `/metrics`
+unrestricted; aggregates can reveal activity patterns. Responses use
+`Cache-Control: no-store`.
+
+The process keeps only aggregate counters and the last acceptance timestamp:
+
+| Metric | Meaning |
+|---|---|
+| `aesgcm_proxy_forward_attempts_total` | Completed outbound attempts |
+| `aesgcm_proxy_forward_accepted_total` | Distributor returned HTTP 2xx |
+| `aesgcm_proxy_forward_rejected_total` | Distributor returned non-2xx (including redirects, which are not followed) |
+| `aesgcm_proxy_forward_network_errors_total` | No HTTP response: DNS, connection, TLS, or timeout failure |
+| `aesgcm_proxy_simple_push_suppressed_total` | Correlated PUT suppressed without another outbound request |
+| `aesgcm_proxy_forward_duration_seconds_sum` | Total seconds until response headers or network failure |
+| `aesgcm_proxy_last_accepted_timestamp_seconds` | Unix time of last HTTP 2xx, or `0` before the first acceptance |
+
+Both UnifiedPush and FCM forwarding use these counters. Invalid inbound requests
+and disabled FCM routes do not count as outbound attempts; a correlated PUT
+increments only the suppressed counter. Attempts equal accepted + rejected +
+network errors. Timing excludes correlation waits and response body streaming.
+Counters reset on restart. There are no per-user labels, endpoint URLs, tokens,
+keys, payloads, or per-request histories, and scraping sends no outbound push.
+
+**Acceptance is not a device delivery receipt.** Metrics help distinguish a
+responsive gateway from a failed forwarding path, but cannot prove receipt or
+decryption on the phone. To verify the full path, send a real test message and
+check reception/decryption on the device. Device acknowledgements would require
+client-side support and are outside this endpoint's scope.
 
 ## FCM leg
 
