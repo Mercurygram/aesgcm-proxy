@@ -20,7 +20,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
+use p256::elliptic_curve::Generate;
 use p256::SecretKey;
 use reqwest::header::HeaderValue;
 use std::fmt;
@@ -66,7 +67,7 @@ impl VapidSigner {
 
     fn from_secret(secret: SecretKey) -> Self {
         let public_key =
-            URL_SAFE_NO_PAD.encode(secret.public_key().to_encoded_point(false).as_bytes());
+            URL_SAFE_NO_PAD.encode(secret.public_key().to_sec1_point(false).as_bytes());
         Self {
             key: SigningKey::from(&secret),
             public_key,
@@ -75,9 +76,7 @@ impl VapidSigner {
     }
 
     pub fn generate() -> Self {
-        Self::from_secret(SecretKey::random(
-            &mut p256::elliptic_curve::rand_core::OsRng,
-        ))
+        Self::from_secret(SecretKey::generate())
     }
 
     pub fn public_key(&self) -> &str {
@@ -159,7 +158,7 @@ mod tests {
     use super::*;
     use p256::ecdsa::signature::Verifier;
     use p256::ecdsa::VerifyingKey;
-    use p256::EncodedPoint;
+    use p256::Sec1Point;
 
     #[test]
     fn jwt_header_constant_matches_its_json() {
@@ -185,8 +184,8 @@ mod tests {
 
         let (signing_input, signature) = token.rsplit_once('.').unwrap();
 
-        let point = EncodedPoint::from_bytes(URL_SAFE_NO_PAD.decode(advertised).unwrap()).unwrap();
-        let verifying = VerifyingKey::from_encoded_point(&point).unwrap();
+        let point = Sec1Point::from_bytes(URL_SAFE_NO_PAD.decode(advertised).unwrap()).unwrap();
+        let verifying = VerifyingKey::from_sec1_point(&point).unwrap();
         let signature = Signature::from_slice(&URL_SAFE_NO_PAD.decode(signature).unwrap()).unwrap();
         verifying
             .verify(signing_input.as_bytes(), &signature)
