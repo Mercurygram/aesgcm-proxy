@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Timothy Redaelli <timothy.redaelli@gmail.com>
+// SPDX-FileCopyrightText: 2026 lesecuritae <lesecuritae@tutanota.com>
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
@@ -8,7 +9,7 @@ use axum::{
     http::header::{AUTHORIZATION, LOCATION},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{post, put},
+    routing::{get, post, put},
     Router,
 };
 use listenfd::ListenFd;
@@ -20,7 +21,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 use tracing::{error, info, warn};
 use url::Url;
@@ -39,6 +40,46 @@ struct AppState {
     /// VAPID signer for the FCM leg. `None` when VAPID_PRIVATE_KEY is unset,
     /// which leaves /fcm answering 503 while the rest of the proxy works.
     vapid: Option<VapidSigner>,
+    /// Opt-in, process-wide aggregates; never store destinations or payloads.
+    stats: Option<Mutex<ForwardStats>>,
+}
+
+#[derive(Default)]
+struct ForwardStats {
+    attempts: u64,
+    accepted: u64,
+    rejected: u64,
+    network_errors: u64,
+    suppressed: u64,
+    duration_seconds: f64,
+    last_accepted_timestamp_seconds: u64,
+}
+
+impl AppState {
+    fn record_forward(&self, status: Option<StatusCode>, elapsed: Duration) {
+        if let Some(stats) = &self.stats {
+            let mut stats = stats.lock().unwrap_or_else(|p| p.into_inner());
+            stats.attempts += 1;
+            stats.duration_seconds += elapsed.as_secs_f64();
+            match status {
+                Some(status) if status.is_success() => {
+                    stats.accepted += 1;
+                    stats.last_accepted_timestamp_seconds = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                }
+                Some(_) => stats.rejected += 1,
+                None => stats.network_errors += 1,
+            }
+        }
+    }
+
+    fn record_suppressed(&self) {
+        if let Some(stats) = &self.stats {
+            stats.lock().unwrap_or_else(|p| p.into_inner()).suppressed += 1;
+        }
+    }
 }
 
 /// Correlation window: PUT handler waits this long for a matching POST /aesgcm.
@@ -79,6 +120,7 @@ async fn simple_push(
 ) -> Response {
     // Fast path: check if a POST already arrived before we even started waiting.
     if recent_post_within_window(&state.recent_posts, endpoint.as_str()) {
+        state.record_suppressed();
         info!("put correlated (pre-wait) for {}", fcm::Redacted(endpoint));
         return StatusCode::OK.into_response();
     }
@@ -87,12 +129,13 @@ async fn simple_push(
     tokio::time::sleep(CORRELATION_WINDOW).await;
 
     if recent_post_within_window(&state.recent_posts, endpoint.as_str()) {
+        state.record_suppressed();
         info!("put correlated (post-wait) for {}", fcm::Redacted(endpoint));
         return StatusCode::OK.into_response();
     }
 
     info!("put synthetic wake-up for {}", fcm::Redacted(endpoint));
-    match forward(&state.client, endpoint, body, auth).await {
+    match forward(state, endpoint, body, auth).await {
         Ok(upstream) => {
             let status = upstream.status();
             if !status.is_success() {
@@ -164,7 +207,7 @@ async fn aesgcm(
     if encryption.is_empty() || crypto_key.is_empty() {
         warn!(
             "aesgcm request to {} missing Encryption/Crypto-Key headers, decryption will fail on device",
-            endpoint
+            fcm::Redacted(&endpoint)
         );
     }
 
@@ -181,7 +224,7 @@ async fn post_and_record(
     auth: Option<HeaderValue>,
     body: impl Into<reqwest::Body>,
 ) -> Response {
-    let upstream = match forward(&state.client, endpoint, body, auth).await {
+    let upstream = match forward(state, endpoint, body, auth).await {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -476,19 +519,28 @@ fn validate_endpoint(endpoint: &str) -> Result<Url, Response> {
 // built once per failed request, so boxing it would only move the cost around.
 #[allow(clippy::result_large_err)]
 async fn forward(
-    client: &Client,
+    state: &AppState,
     endpoint: &Url,
     body: impl Into<reqwest::Body>,
     auth: Option<HeaderValue>,
 ) -> Result<reqwest::Response, Response> {
-    let mut req = client.post(endpoint.clone()).body(body);
+    let started = Instant::now();
+    let mut req = state.client.post(endpoint.clone()).body(body);
     if let Some(auth) = auth {
         req = req.header(AUTHORIZATION, auth);
     }
-    req.send().await.map_err(|err| {
-        error!("forward error: {err}");
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-    })
+    match req.send().await {
+        Ok(response) => {
+            state.record_forward(Some(response.status()), started.elapsed());
+            Ok(response)
+        }
+        Err(err) => {
+            state.record_forward(None, started.elapsed());
+            // reqwest errors can include a subscription URL containing a token.
+            error!("forward error: {}", err.without_url());
+            Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
 }
 
 /// Periodically evict stale entries from the correlation cache.
@@ -607,16 +659,13 @@ async fn main() {
         client,
         recent_posts: Mutex::new(HashMap::new()),
         vapid,
+        stats: (std::env::var("ENABLE_METRICS").as_deref() == Ok("1"))
+            .then(|| Mutex::new(ForwardStats::default())),
     });
 
     tokio::spawn(cleanup_recent_posts(Arc::clone(&state)));
 
-    let app = Router::new()
-        .route("/aesgcm", post(aesgcm))
-        .route("/fcm/{token}", post(fcm_post).put(fcm_put))
-        .route("/{*path}", put(put_proxy))
-        .layer(DefaultBodyLimit::max(65536))
-        .with_state(state);
+    let app = app_router(state);
 
     let listener = {
         let mut listenfd = ListenFd::from_env();
@@ -638,4 +687,384 @@ async fn main() {
 
     info!("listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Liveness only: no distributor requests or subscription data.
+async fn healthz() -> impl IntoResponse {
+    ([("cache-control", "no-store")], "ok\n")
+}
+
+/// Aggregate outcomes at the distributor boundary, not device receipts.
+async fn metrics(State(state): State<Arc<AppState>>) -> Response {
+    let Some(stats) = &state.stats else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let stats = stats.lock().unwrap_or_else(|p| p.into_inner());
+    let mut body = String::new();
+    use std::fmt::Write;
+    for (name, help, kind, value) in [
+        ("aesgcm_proxy_forward_attempts_total", "Completed outbound attempts, including HTTP rejections and network errors.", "counter", stats.attempts.to_string()),
+        ("aesgcm_proxy_forward_accepted_total", "Outbound requests accepted with HTTP 2xx; not device delivery receipts.", "counter", stats.accepted.to_string()),
+        ("aesgcm_proxy_forward_rejected_total", "Outbound requests answered with non-2xx HTTP status.", "counter", stats.rejected.to_string()),
+        ("aesgcm_proxy_forward_network_errors_total", "Outbound requests failing before an HTTP response, including DNS and TLS failures.", "counter", stats.network_errors.to_string()),
+        ("aesgcm_proxy_simple_push_suppressed_total", "Correlated PUT wake-ups suppressed without an outbound request.", "counter", stats.suppressed.to_string()),
+        ("aesgcm_proxy_forward_duration_seconds_sum", "Total seconds to obtain outbound response headers or a network error; excludes response body streaming.", "counter", stats.duration_seconds.to_string()),
+        ("aesgcm_proxy_last_accepted_timestamp_seconds", "Unix time of the last outbound HTTP 2xx, or zero before any acceptance.", "gauge", stats.last_accepted_timestamp_seconds.to_string()),
+    ] {
+        writeln!(body, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}").unwrap();
+    }
+    (
+        [
+            ("content-type", "text/plain; version=0.0.4; charset=utf-8"),
+            ("cache-control", "no-store"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn app_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
+        .route("/aesgcm", post(aesgcm))
+        .route("/fcm/{token}", post(fcm_post).put(fcm_put))
+        .route("/{*path}", put(put_proxy))
+        .layer(DefaultBodyLimit::max(65536))
+        .with_state(state)
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    #[tokio::test]
+    async fn health_and_existing_routes_without_vapid() {
+        let state = Arc::new(AppState {
+            client: Client::new(),
+            recent_posts: Mutex::new(HashMap::new()),
+            vapid: None,
+            stats: None,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app_router(state)).await.unwrap();
+        });
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let response = client.get(format!("{base}/healthz")).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.text().await.unwrap(), "ok\n");
+        assert_eq!(
+            client
+                .get(format!("{base}/metrics"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let response = client.head(format!("{base}/healthz")).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.bytes().await.unwrap().is_empty());
+        assert_eq!(
+            client
+                .post(format!("{base}/aesgcm"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            client
+                .put(format!("{base}/not-a-url"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        server.abort();
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+
+    async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (base, task)
+    }
+
+    fn push_url(base: &str, endpoint: &str) -> Url {
+        let mut url = Url::parse(&format!("{base}/aesgcm")).unwrap();
+        url.query_pairs_mut().append_pair("e", endpoint);
+        url
+    }
+
+    fn simple_push_url(base: &str, endpoint: &str) -> Url {
+        let mut url = Url::parse(base).unwrap();
+        url.path_segments_mut().unwrap().push(endpoint);
+        url
+    }
+
+    #[tokio::test]
+    async fn records_real_forwarding_outcomes_without_subscription_data() {
+        let received = Arc::new(Mutex::new(Vec::<Bytes>::new()));
+        let captured = Arc::clone(&received);
+        let upstream = Router::new()
+            .route(
+                "/accepted/{token}",
+                post(move |body: Bytes| {
+                    let captured = Arc::clone(&captured);
+                    async move {
+                        captured.lock().unwrap().push(body);
+                        StatusCode::ACCEPTED
+                    }
+                }),
+            )
+            .route(
+                "/rejected",
+                post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+            );
+        let (upstream_base, upstream_task) = serve(upstream).await;
+        let upstream_addr: SocketAddr = upstream_base
+            .strip_prefix("http://")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let client = Client::builder()
+            .no_proxy()
+            .resolve("push.example", upstream_addr)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        // Test-only client mapping: production still uses SafeResolver.
+        let state = Arc::new(AppState {
+            client,
+            recent_posts: Mutex::new(HashMap::new()),
+            vapid: None,
+            stats: Some(Mutex::new(ForwardStats::default())),
+        });
+        let (base, proxy_task) = serve(app_router(Arc::clone(&state))).await;
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let target = format!(
+            "http://push.example:{}/accepted/private-token?secret=hidden",
+            upstream_addr.port()
+        );
+
+        let initial = client.get(format!("{base}/metrics")).send().await.unwrap();
+        assert_eq!(initial.status(), StatusCode::OK);
+        assert_eq!(initial.headers()["cache-control"], "no-store");
+        assert_eq!(
+            initial.headers()["content-type"],
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        assert!(initial
+            .text()
+            .await
+            .unwrap()
+            .contains("aesgcm_proxy_last_accepted_timestamp_seconds 0\n"));
+        let response = client
+            .post(push_url(&base, &target))
+            .header("encryption", "salt=test")
+            .header("crypto-key", "dh=test")
+            .body(vec![0, 1, 255])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()[LOCATION], target);
+        assert_eq!(
+            received.lock().unwrap()[0].as_ref(),
+            b"aesgcm\nEncryption: salt=test\nCrypto-Key: dh=test\n\x00\x01\xff"
+        );
+        let response = client
+            .put(simple_push_url(&base, &target))
+            .body("version=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(received.lock().unwrap().len(), 1);
+        let wake_target = format!(
+            "http://push.example:{}/accepted/other-token",
+            upstream_addr.port()
+        );
+        assert_eq!(
+            client
+                .put(simple_push_url(&base, &wake_target))
+                .body("version=2")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(received.lock().unwrap()[1].as_ref(), b"version=2");
+        let reject_target = format!("http://push.example:{}/rejected", upstream_addr.port());
+        assert_eq!(
+            client
+                .post(push_url(&base, &reject_target))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(!state
+            .recent_posts
+            .lock()
+            .unwrap()
+            .contains_key(&reject_target));
+        // An invalid/private destination is rejected before any outbound attempt.
+        assert_eq!(
+            client
+                .post(push_url(&base, "http://127.0.0.1/private"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/fcm/test-token"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // Resolve failure is deterministic and does not depend on public DNS.
+        let failed_client = Client::builder()
+            .no_proxy()
+            .dns_resolver(Arc::new(FailingResolver))
+            .build()
+            .unwrap();
+        let failed_state = AppState {
+            client: failed_client,
+            recent_posts: Mutex::new(HashMap::new()),
+            vapid: None,
+            stats: Some(Mutex::new(ForwardStats::default())),
+        };
+        let result = forward(
+            &failed_state,
+            &Url::parse("http://push.example/private-token").unwrap(),
+            "",
+            None,
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        {
+            let failed = failed_state.stats.as_ref().unwrap().lock().unwrap();
+            assert_eq!(
+                (
+                    failed.attempts,
+                    failed.network_errors,
+                    failed.accepted,
+                    failed.rejected
+                ),
+                (1, 1, 0, 0)
+            );
+        }
+
+        let output = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        for expected in [
+            "aesgcm_proxy_forward_attempts_total 3\n",
+            "aesgcm_proxy_forward_accepted_total 2\n",
+            "aesgcm_proxy_forward_rejected_total 1\n",
+            "aesgcm_proxy_forward_network_errors_total 0\n",
+            "aesgcm_proxy_simple_push_suppressed_total 1\n",
+        ] {
+            assert!(output.contains(expected), "missing {expected}: {output}");
+        }
+        assert!(!output.contains("private-token"));
+        assert!(!output.contains("push.example"));
+        assert!(!output.contains("hidden"));
+        assert!(!output.contains("salt=test"));
+        {
+            let stats = state.stats.as_ref().unwrap().lock().unwrap();
+            assert!(stats.last_accepted_timestamp_seconds > 0);
+            assert!(stats.duration_seconds > 0.0);
+        }
+        assert!(client
+            .head(format!("{base}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .is_empty());
+        upstream_task.abort();
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn counts_put_correlated_during_wait_without_forwarding() {
+        let state = AppState {
+            client: Client::new(),
+            recent_posts: Mutex::new(HashMap::new()),
+            vapid: None,
+            stats: Some(Mutex::new(ForwardStats::default())),
+        };
+        let endpoint = Url::parse("https://push.example/synthetic-token").unwrap();
+        let (response, ()) =
+            tokio::join!(simple_push(&state, &endpoint, None, Bytes::new()), async {
+                state
+                    .recent_posts
+                    .lock()
+                    .unwrap()
+                    .insert(endpoint.as_str().to_owned(), Instant::now());
+            });
+        assert_eq!(response.status(), StatusCode::OK);
+        let stats = state.stats.as_ref().unwrap().lock().unwrap();
+        assert_eq!(stats.suppressed, 1);
+        assert_eq!(stats.attempts, 0);
+    }
+
+    struct FailingResolver;
+    impl Resolve for FailingResolver {
+        fn resolve(&self, _: Name) -> Resolving {
+            Box::pin(async {
+                Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "synthetic DNS failure",
+                )) as _)
+            })
+        }
+    }
 }
